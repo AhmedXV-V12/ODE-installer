@@ -1,0 +1,18 @@
+#!/bin/sh
+# shutdown shim: PID 1 is a shell script, so power off/reboot directly.
+#   shutdown [-r|--reboot] [-h|-P|--poweroff] [now|+0]
+ACTION=poweroff
+for a in "$@"; do
+    case "$a" in
+        -r|--reboot) ACTION=reboot ;;
+        -h|-H|-P|--halt|--poweroff) ACTION=poweroff ;;
+    esac
+done
+sync
+umount /run/ode/target /run/ode/esp /run/ode/medium /run/ode/host >/dev/null 2>&1
+umount -a -r >/dev/null 2>&1
+sync
+if [ "$ACTION" = reboot ]; then
+    exec /bin/busybox reboot -f
+fi
+exec /bin/busybox poweroff -f

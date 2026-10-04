@@ -1,0 +1,13 @@
+#!/bin/sh
+# The ODE session (/usr/bin/ode-x11) starts the installer itself.
+# Only start it here when openbox-session is used outside that session.
+[ -n "$ODE_SESSION" ] && exit 0
+
+export DISPLAY=${DISPLAY:-:0}
+export SDL_VIDEODRIVER=x11
+export SDL_AUDIODRIVER=dummy
+export LIBGL_ALWAYS_SOFTWARE=1
+
+if [ -x /app/app.bin ]; then
+    cd /app && exec /app/app.bin
+fi

@@ -1,0 +1,23 @@
+{
+  "logo_path": null,
+  "logos_dir": null,
+  "system": {
+    "name": "IFelxOS2",
+    "image": "/run/ode/medium/ifelxos/filesystem.squashfs",
+    "default_hostname": "ifelxos2",
+    "min_root_mib": 6144
+  },
+  "pages": {
+    "welcome": {
+      "title": "ODE Installer",
+      "subtitle": "by IFOS system"
+    },
+    "terms": {
+      "body": "IFelxOS is built on IFOS. IFOS provides the lightweight core and system foundation, whilst IFelxOS provides the complete operating system with its interface, applications and user experience. This software is licensed under AGPL-3.0. By continuing you accept all listed terms and conditions."
+    },
+    "finish": {
+      "title": "Installation Complete",
+      "message": "IFelxOS2 is installed. Remove the installation media, then restart the computer and sign in with the account you created."
+    }
+  }
+}

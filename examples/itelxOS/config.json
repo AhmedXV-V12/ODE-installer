@@ -1,0 +1,23 @@
+{
+  "logo_path": null,
+  "logos_dir": null,
+  "system": {
+    "name": "itelxOS",
+    "image": "/run/ode/medium/ifelxos/filesystem.squashfs",
+    "default_hostname": "itelx",
+    "min_root_mib": 256
+  },
+  "pages": {
+    "welcome": {
+      "title": "ODE Installer",
+      "subtitle": "itelxOS 1.2"
+    },
+    "terms": {
+      "body": "This installs itelxOS 1.2, a 64-bit operating system of the IFelx family with its own kernel, the ITFS filesystem, the itelx terminal and the XVC language. By continuing you accept all listed terms and conditions."
+    },
+    "finish": {
+      "title": "Installation Complete",
+      "message": "itelxOS is installed. Remove the installation media, then restart the computer: it starts straight into the itelx terminal."
+    }
+  }
+}

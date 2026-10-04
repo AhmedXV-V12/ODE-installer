@@ -1,0 +1,98 @@
+#!/bin/sh
+# ODE Installer - PID 1
+# PID 1 must never exit: any exit causes "Kernel panic - Attempted to kill init".
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+export TERM=linux
+export LANG=C.UTF-8
+umask 022
+
+mkdir -p /proc /sys /dev /run /tmp /var/log /var/lib/xkb /mnt
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+# /dev/pts and /dev/shm must be created after devtmpfs is mounted over /dev
+mkdir -p /dev/pts /dev/shm
+mount -t devpts -o gid=5,mode=620 devpts /dev/pts 2>/dev/null
+mount -t tmpfs -o mode=1777 tmpfs /dev/shm 2>/dev/null
+mount -t tmpfs -o mode=0755 tmpfs /run 2>/dev/null
+[ -d /sys/firmware/efi/efivars ] && mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
+chmod 1777 /tmp
+mkdir -p /run/ode
+
+exec </dev/console >/dev/console 2>&1
+
+LOG=/var/log/ode-init.log
+log() { echo "[ode-init] $*"; echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+hostname -F /etc/hostname 2>/dev/null || hostname ode
+
+DEBUG=0
+grep -qw 'ode.debug=1' /proc/cmdline && DEBUG=1
+
+rescue_shell() {
+    log "starting rescue shell (type 'exit' to retry the installer)"
+    setsid /bin/busybox cttyhack /bin/sh -l
+}
+
+# ---- devices and their drivers ---------------------------------------------
+# udev loads the driver of every device, including the ones that appear late
+# (laptop touchpads on I2C come up seconds after their bus) or are plugged in
+# later, and tells Xorg about input devices as they come and go.
+KVER=$(uname -r)
+[ -d "/lib/modules/$KVER" ] || log "WARNING: no kernel modules found for $KVER"
+for m in xhci_pci ehci_pci ohci_pci uhci_hcd usbhid hid_generic \
+         ahci nvme usb_storage uas sr_mod sd_mod virtio_blk virtio_scsi isofs; do
+    /usr/sbin/modprobe -bq "$m" 2>/dev/null
+done
+if /usr/lib/systemd/systemd-udevd --daemon --resolve-names=never 2>>"$LOG"; then
+    udevadm trigger --type=subsystems --action=add
+    udevadm trigger --type=devices --action=add
+    udevadm settle --timeout=30 || log "WARNING: udev did not settle in 30 s"
+else
+    log "WARNING: udevd did not start; loading drivers once"
+    find /sys/devices -name modalias -type f 2>/dev/null | xargs cat 2>/dev/null | sort -u \
+        | xargs -r /usr/sbin/modprobe -abq 2>/dev/null
+fi
+
+# wait for a display device (DRM or framebuffer)
+i=0
+while [ "$i" -lt 50 ] && [ ! -e /dev/dri/card0 ] && [ ! -e /dev/fb0 ]; do
+    sleep 0.1
+    i=$((i + 1))
+done
+[ -e /dev/dri/card0 ] || [ -e /dev/fb0 ] || log "WARNING: no display device found"
+
+# ---- the installation medium ------------------------------------------------
+# It carries the system the installer writes. A USB stick may need a moment.
+if dev=$(/usr/sbin/ode-find-medium 30); then
+    log "installation medium: $dev"
+else
+    log "WARNING: the installation medium (ifelxos/filesystem.squashfs) was not found"
+fi
+
+[ "$DEBUG" = 1 ] && rescue_shell
+
+# ---- installer session loop ----------------------------------------------
+fails=0
+while true; do
+    start=$(date +%s)
+    /usr/bin/ode-x11
+    rc=$?
+    log "installer session exited rc=$rc"
+
+    if [ $(( $(date +%s) - start )) -lt 20 ]; then
+        fails=$((fails + 1))
+    else
+        fails=0
+    fi
+
+    if [ "$fails" -ge 3 ]; then
+        log "installer failed to start 3 times, see /var/log/Xorg.0.log and /var/log/ode-session.log"
+        tail -n 40 /var/log/ode-session.log 2>/dev/null
+        rescue_shell
+        fails=0
+    fi
+    sleep 2
+done

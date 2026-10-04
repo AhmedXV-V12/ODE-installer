@@ -1,0 +1,89 @@
+#!/bin/sh
+# ode-find-medium - mounts the installation medium at /run/ode/medium.
+#
+# The medium carries ifelxos/filesystem.squashfs, the system the installer
+# writes. How it was made decides what it looks like:
+#   * a CD, or a USB stick written as an image (dd, Etcher, Rufus "DD mode"):
+#     an ISO 9660 filesystem, on the whole stick and on its first partition
+#   * a USB stick the files were copied to (Rufus "ISO mode", by hand): a FAT,
+#     exFAT or NTFS partition holding them
+#   * the ISO kept as a file (Ventoy, or copied to any disk): a partition with
+#     the .iso on it; the ISO is mounted from there through a loop device
+# Other disks are only ever mounted read-only (ext4 without journal replay),
+# so looking at them changes nothing. A USB stick can take a few seconds to
+# appear, so the search repeats for up to <seconds> (default 0: one pass).
+# The device the medium is on goes to /run/ode/medium.dev: it is never offered
+# as a place to install.
+#   usage: ode-find-medium [seconds]      prints that device on success
+
+MNT=/run/ode/medium
+HOST=/run/ode/host               # the partition an ISO file is on
+FILE=ifelxos/filesystem.squashfs
+DEVFILE=/run/ode/medium.dev
+LIST=/run/ode/iso-candidates
+
+if [ -f "$MNT/$FILE" ] && [ -s "$DEVFILE" ]; then
+    cat "$DEVFILE"
+    exit 0
+fi
+mkdir -p "$MNT" "$HOST"
+for m in isofs udf vfat exfat ntfs3; do /usr/sbin/modprobe -q "$m" 2>/dev/null; done
+
+found() {
+    echo "$1" > "$DEVFILE"
+    echo "$1"
+    exit 0
+}
+
+# CD drives first, then every other disk and partition
+candidates() {
+    { ls /sys/class/block | grep '^sr'; ls /sys/class/block | grep -v '^sr'; } |
+    while read -r d; do
+        case "$d" in loop*|ram*|zram*|dm-*|md*) continue ;; esac
+        [ -b "/dev/$d" ] || continue
+        [ "$(cat "/sys/class/block/$d/size" 2>/dev/null)" != 0 ] || continue
+        echo "/dev/$d"
+    done
+}
+
+# mounts a device read-only, by the filesystem blkid finds on it
+mount_ro() {
+    t=$(blkid -p -o value -s TYPE "$1" 2>/dev/null)
+    case "$t" in
+        iso9660|udf|vfat|exfat) mount -t "$t" -o ro "$1" "$2" 2>/dev/null ;;
+        ntfs) mount -t ntfs3 -o ro "$1" "$2" 2>/dev/null ;;
+        ext4|ext3|ext2) mount -t "$t" -o ro,noload "$1" "$2" 2>/dev/null ;;
+        # a stick written as an image can carry both a partition table and
+        # ISO 9660, and then blkid names neither
+        "") mount -t iso9660 -o ro "$1" "$2" 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+end=$(( $(date +%s) + ${1:-0} ))
+while :; do
+    # the medium itself
+    for dev in $(candidates); do
+        if mount_ro "$dev" "$MNT"; then
+            [ -f "$MNT/$FILE" ] && found "$dev"
+            umount "$MNT"
+        fi
+    done
+    # an ISO file on a partition
+    for dev in $(candidates); do
+        mount_ro "$dev" "$HOST" || continue
+        find "$HOST" -maxdepth 3 -type f -iname '*.iso' -size +500M 2>/dev/null | head -n 20 > "$LIST"
+        while IFS= read -r iso; do
+            if mount -t iso9660 -o ro,loop "$iso" "$MNT" 2>/dev/null; then
+                if [ -f "$MNT/$FILE" ]; then
+                    echo "$iso" > /run/ode/medium.iso
+                    found "$dev"                     # the partition stays mounted
+                fi
+                umount "$MNT"
+            fi
+        done < "$LIST"
+        umount "$HOST"
+    done
+    [ "$(date +%s)" -ge "$end" ] && exit 1
+    sleep 1
+done
