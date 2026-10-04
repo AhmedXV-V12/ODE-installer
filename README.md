@@ -121,7 +121,7 @@ the stock backend). Inside WSL (Ubuntu 24.04) or Ubuntu, as root:
 mkdir -p input
 cp /path/to/IFelxOS2.iso input/IFelxOS2.iso      # its live/filesystem.squashfs is installed
 cp /path/to/earlier-ODE.iso input/ODE_base.iso   # the kernel 6.8.0-142 and its modules come from it
-git clone <IFelxBoot> ../IFelxBoot               # the UEFI loader (or set IFELXBOOT=...)
+sh IFelxBoot/build.sh              # the UEFI loader (build-ode.sh also runs it)
 bash build/build-ode.sh            # ODE_installer.iso; the Ubuntu base is built once, then reused
 bash build/build-ode.sh --rootfs   # rebuild the Ubuntu base too
 python3 build/e2e-ode.py erase     # QEMU/KVM: erase a disk, install, start on UEFI and BIOS
@@ -135,14 +135,35 @@ ODE_installer_code_app.bin/  the window (Python + pygame): app.py, ODE.py, confi
 fix_src/                     files placed in the installer system: init, ode-install,
                              ode-find-medium, ode-x11, ode-xorg-conf, grub.cfg, ...
 build/                       build-ode.sh, e2e-ode.py, vm.py (QEMU driver for the tests)
+IFelxBoot/                   the UEFI boot loader of the medium and of installed systems,
+                             written from scratch against the UEFI specification (C, no
+                             external library; clang + lld-link): src/, build.sh, tests/
 tools/make-custom-ode.sh     an ODE installer for your system from a finished ODE ISO
 examples/itelxOS/            config.json and ode-install for a non-Linux system
 docs/screenshots/            screens from the virtual machine tests
 ```
 
+## Licences of the systems ODE carries
+
+ODE is AGPL-3.0. A system you put in ODE is a separate work that only sits on
+the same medium, so ODE's licence does not extend to it and it keeps its own
+(the AGPL calls this an aggregate). Two things to check before you share an
+installer:
+
+* your system's licence must allow it to be redistributed (itelxOS: its
+  kernel licence allows unchanged copies on installation media; its userspace
+  is MPL-2.0);
+* the medium also contains ODE and the Ubuntu packages of the installer
+  system, so point to this repository for ODE's source and to the Ubuntu
+  archive (packages from Ubuntu 24.04 "noble", kernel 6.8.0-142) for theirs.
+
+A backend you write for your system (`--backend`) is a separate program the
+window runs; the one in `examples/itelxOS/` is part of this repository and is
+AGPL-3.0 like the rest of it.
+
 ## Fonts
 
-The window prefers Arial (`ODE_installer_code_app.bin/fonts/ARIAL.TTF`,
-`ARIALBD.TTF`). Arial is not free to redistribute, so it is not in this
-repository; without it the window uses DejaVu Sans from the installer system.
-Put the files there yourself if you have a licence for them.
+The window uses Liberation Sans (SIL Open Font License 1.1), which has the
+same metrics as Arial, from the installer system's `fonts-liberation`
+package; DejaVu Sans if it is missing. No font files are kept in this
+repository.

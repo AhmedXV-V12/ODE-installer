@@ -51,10 +51,10 @@ class ODE:
         
         # إعداد المسارات
         self.DIR = os.path.dirname(__file__)
-        fonts_path = os.path.join(self.DIR, 'fonts')
-        # Arial is not shipped with the sources (it is not free to redistribute);
-        # without it the window uses DejaVu Sans from the installer system.
-        self.FONT_PATH = os.path.join(fonts_path, 'ARIAL.TTF')
+        # Liberation Sans (SIL Open Font License) has Arial's metrics, so the
+        # pages keep their layout; it comes from the installer system's
+        # fonts-liberation package. DejaVu Sans if it is missing.
+        self.FONT_PATH = '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf'
         if not os.path.exists(self.FONT_PATH):
             self.FONT_PATH = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
         

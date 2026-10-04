@@ -4,5 +4,4 @@
 input/
 archive/
 __pycache__/
-ODE_installer_code_app.bin/fonts/*.TTF
-ODE_installer_code_app.bin/fonts/*.ttf
+IFelxBoot/out/

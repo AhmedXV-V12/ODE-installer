@@ -13,7 +13,7 @@
       "subtitle": "itelxOS 1.2"
     },
     "terms": {
-      "body": "This installs itelxOS 1.2, a 64-bit operating system of the IFelx family with its own kernel, the ITFS filesystem, the itelx terminal and the XVC language. By continuing you accept all listed terms and conditions."
+      "body": "This installs itelxOS 1.2, a 64-bit operating system of the IFelx family with its own kernel, the ITFS filesystem, the itelx terminal and the XVC language. Its kernel is licensed under the itelx Kernel License 1.0 (use and share unchanged) and its userspace under the Mozilla Public License 2.0. By continuing you accept all listed terms and conditions."
     },
     "finish": {
       "title": "Installation Complete",

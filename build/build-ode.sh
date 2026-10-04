@@ -7,7 +7,7 @@
 # sits on the medium as /ifelxos/filesystem.squashfs and is read from there.
 # The kernel and its modules are the ones of the previous ODE image (Ubuntu
 # 6.8.0-142, simpledrm built in), taken from an earlier ODE image (BASE_ISO).
-# The medium starts on UEFI through IFelxBoot (IFELXBOOT, a separate project)
+# The medium starts on UEFI through IFelxBoot (IFelxBoot/ in this repository)
 # and on BIOS through GRUB.
 #
 #   usage: sudo build/build-ode.sh [--rootfs] [output.iso]
@@ -17,7 +17,7 @@
 # Runs inside WSL (Ubuntu 24.04) as root; the work area is /root/ode.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"           # the repository
-IFELXBOOT=${IFELXBOOT:-"$(dirname "$HERE")/IFelxBoot"}
+IFELXBOOT=${IFELXBOOT:-"$HERE/IFelxBoot"}    # the UEFI loader, in this repository
 WORK=${WORK:-/root/ode}
 ROOTFS=$WORK/rootfs          # the Ubuntu base, kept between builds
 STAGE=$WORK/stage            # the base plus the installer: the initrd's contents
@@ -52,7 +52,7 @@ PACKAGES="
   udev
   x11-xserver-utils x11-xkb-utils xkb-data openbox
   python3 python3-pygame
-  fonts-dejavu-core adwaita-icon-theme hicolor-icon-theme librsvg2-common shared-mime-info
+  fonts-dejavu-core fonts-liberation adwaita-icon-theme hicolor-icon-theme librsvg2-common shared-mime-info
 "
 
 chroot_mounts() {
@@ -228,11 +228,8 @@ rm -f "$STAGE/dev/console"; mknod -m 600 "$STAGE/dev/console" c 5 1
 rm -f "$STAGE/dev/null"; mknod -m 666 "$STAGE/dev/null" c 1 3
 
 # the installer window
-rm -rf "$STAGE/app"; mkdir -p "$STAGE/app/fonts"
+rm -rf "$STAGE/app"; mkdir -p "$STAGE/app"
 install -m 644 "$APP_SRC/app.py" "$APP_SRC/ODE.py" "$APP_SRC/logo.png" "$STAGE/app/"
-for f in ARIAL.TTF ARIALBD.TTF; do        # optional, see ODE_installer_code_app.bin/fonts/README
-    [ -f "$APP_SRC/fonts/$f" ] && install -m 644 "$APP_SRC/fonts/$f" "$STAGE/app/fonts/"
-done
 python3 - "$APP_SRC/config.json" "$STAGE/app/config.json" "$MIN_ROOT_MIB" <<'EOF'
 import json, sys
 cfg = json.load(open(sys.argv[1], encoding="utf-8"))
