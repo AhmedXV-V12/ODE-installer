@@ -1,0 +1,564 @@
+#!/bin/sh
+# ode-install - installs IFelxOS2 from the ODE installation medium.
+#
+#   ode-install check erase  <disk>
+#   ode-install check manual <disk> <root-partition>
+#       Says whether an installation can go ahead, and changes nothing.
+#       Prints OK, WARN <message> or FAIL <message> lines; exit status 1 on FAIL.
+#
+#   ode-install erase  <disk> <hostname> <account>
+#   ode-install manual <disk> <root-partition> <hostname> <account>
+#       Installs. The account's password is the first line on standard input,
+#       never an argument.
+#
+# erase  writes a new partition table, the same layout IFelxOS2's own installer
+#        uses: an EFI system partition (256 MiB, FAT) and the root filesystem,
+#        with GRUB in the gap after the MBR. The disk boots on UEFI (IFelxBoot)
+#        and BIOS alike.
+# manual installs on a partition chosen by the user (made in GParted, for
+#        example) and leaves every other partition alone. An EFI system
+#        partition already on the disk is used as it is, never formatted.
+#
+# Output while installing, one message per line, read by the installer window:
+#   STEP <name> <percent>   a stage starts; <percent> is the overall progress
+#   PROGRESS <percent>      overall progress inside a stage
+#   WARN <message>          something that did not stop the installation
+#   ERROR <message>         the installation stopped
+#   DONE                    the installation completed
+#   anything else           a line for the log
+#
+# What the system image carries for its live use is undone on the disk, as
+# IFelxOS2's install.sh does: the live account and its password-less sudo and
+# automatic login are removed, the one account is the one created here, the
+# root password is locked and the machine identity is made fresh.
+
+set -u
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+
+MEDIUM=/run/ode/medium
+IMAGE=$MEDIUM/ifelxos/filesystem.squashfs
+TARGET=/run/ode/target
+ESPDIR=/run/ode/esp
+SYSNAME=IFelxOS2
+ESP_GUID=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+BIOSBOOT_GUID=21686148-6449-6e6f-744e-656564454649
+# what the image needs unpacked (about 2 GiB) and room to use it
+MIN_ROOT_MIB=${ODE_MIN_ROOT_MIB:-6144}
+ESP_MIB=256
+# IFelxBoot copies the kernel and the initrd onto the EFI partition
+ESP_NEED_KIB=$((90 * 1024))
+
+say()  { echo "$*"; }
+warn() { echo "WARN $*"; }
+step() { echo "STEP $1 $2"; }
+
+cleanup() {
+    for m in dev/pts dev sys/firmware/efi/efivars sys proc boot/efi; do
+        umount "$TARGET/$m" 2>/dev/null
+    done
+    umount "$ESPDIR" 2>/dev/null
+    umount "$TARGET" 2>/dev/null
+}
+die() { echo "ERROR $*"; cleanup; exit 1; }
+
+# ---------------------------------------------------------------- helpers
+
+uefi_boot() { [ -d /sys/firmware/efi ]; }
+
+# /dev/sda + 1 -> /dev/sda1, /dev/nvme0n1 + 1 -> /dev/nvme0n1p1
+part_path() {
+    case "$1" in
+        *[0-9]) echo "${1}p$2" ;;
+        *) echo "$1$2" ;;
+    esac
+}
+
+# the partitions of a disk, from sysfs (no udev runs here)
+disk_parts() {
+    b=${1##*/}
+    for s in /sys/class/block/"$b"/"$b"*; do
+        [ -f "$s/partition" ] && echo "/dev/${s##*/}"
+    done
+}
+
+part_number() { cat "/sys/class/block/${1##*/}/partition" 2>/dev/null; }
+
+size_mib() {
+    s=$(cat "/sys/class/block/${1##*/}/size" 2>/dev/null) || s=0
+    echo $((s / 2048))
+}
+
+# blkid's low-level probe reads the device itself, so it works without udev
+probe() { blkid -p -o value -s "$2" "$1" 2>/dev/null | head -n 1; }
+
+parttype() { probe "$1" PART_ENTRY_TYPE | tr 'A-Z' 'a-z'; }
+
+is_esp() {
+    case "$(parttype "$1")" in "$ESP_GUID"|0xef) return 0 ;; esac
+    return 1
+}
+
+find_esp() {
+    for p in $(disk_parts "$1"); do
+        is_esp "$p" && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
+has_biosboot() {
+    for p in $(disk_parts "$1"); do
+        [ "$(parttype "$p")" = "$BIOSBOOT_GUID" ] && return 0
+    done
+    return 1
+}
+
+# the disk the installation medium was found on (ode-find-medium writes the
+# device down: when the medium is an ISO file, the mount is only a loop device)
+medium_disk() {
+    dev=$(cat /run/ode/medium.dev 2>/dev/null)
+    [ -n "$dev" ] || dev=$(awk -v m="$MEDIUM" '$2 == m {print $1}' /proc/mounts | head -n 1)
+    [ -n "$dev" ] || return 1
+    b=${dev##*/}
+    if [ -f "/sys/class/block/$b/partition" ]; then
+        b=$(basename "$(dirname "$(readlink -f "/sys/class/block/$b")")")
+    fi
+    echo "/dev/$b"
+}
+
+# A device "on" a disk: the disk itself or one of its partitions.
+on_disk() {
+    case "$1" in
+        "$2"|"$2"[0-9]*|"$2"p[0-9]*) return 0 ;;
+    esac
+    return 1
+}
+
+# Unmounts everything on the disk and turns its swap off, so the partition
+# table and the filesystems can be written.
+release_disk() {
+    awk '{print $1}' /proc/swaps | while read -r d; do
+        on_disk "$d" "$1" && swapoff "$d" 2>/dev/null
+    done
+    # deepest mount points first
+    awk '{print $1, $2}' /proc/mounts | sort -r -k2 | while read -r d m; do
+        on_disk "$d" "$1" && umount "$m" 2>/dev/null
+    done
+    for d in $(awk '{print $1}' /proc/mounts); do
+        on_disk "$d" "$1" && return 1
+    done
+    return 0
+}
+
+valid_disk() {
+    [ -b "$1" ] || { echo "FAIL $1 is not a disk"; return 1; }
+    [ -f "/sys/class/block/${1##*/}/partition" ] && { echo "FAIL $1 is a partition, not a disk"; return 1; }
+    md=$(medium_disk)
+    [ -n "$md" ] && [ "$md" = "$1" ] && { echo "FAIL $1 holds the installation medium"; return 1; }
+    return 0
+}
+
+# ------------------------------------------------------------------ checks
+
+check_erase() {
+    disk=$1; ok=0
+    valid_disk "$disk" || return 1
+    need=$((MIN_ROOT_MIB + ESP_MIB + 2))
+    have=$(size_mib "$disk")
+    if [ "$have" -lt "$need" ]; then
+        echo "FAIL $disk is too small: $SYSNAME needs at least $(( (need + 1023) / 1024 )) GiB"
+        ok=1
+    fi
+    [ "$have" -gt $((2 * 1024 * 1024)) ] &&
+        echo "WARN only the first 2 TiB of $disk will be used (MBR partition table)"
+    [ -f "$IMAGE" ] || { echo "FAIL the $SYSNAME image was not found on the installation medium"; ok=1; }
+    [ $ok = 0 ] && echo "OK"
+    return $ok
+}
+
+check_manual() {
+    disk=$1; root=$2; ok=0
+    valid_disk "$disk" || return 1
+    [ -b "$root" ] || { echo "FAIL $root does not exist"; return 1; }
+    [ "$(dirname "$(readlink -f "/sys/class/block/${root##*/}")")" = \
+      "$(readlink -f "/sys/class/block/${disk##*/}")" ] ||
+        { echo "FAIL $root is not on $disk"; return 1; }
+    [ -f "$IMAGE" ] || { echo "FAIL the $SYSNAME image was not found on the installation medium"; ok=1; }
+
+    case "$(parttype "$root")" in
+        "$ESP_GUID"|0xef) echo "FAIL $root is the EFI system partition; choose another partition"; return 1 ;;
+        "$BIOSBOOT_GUID") echo "FAIL $root is a BIOS boot partition; choose another partition"; return 1 ;;
+        0x5|0xf|0x85) echo "FAIL $root is an extended partition; choose a partition inside it"; return 1 ;;
+    esac
+    if [ "$(size_mib "$root")" -lt "$MIN_ROOT_MIB" ]; then
+        echo "FAIL $root is too small: $SYSNAME needs at least $(( (MIN_ROOT_MIB + 1023) / 1024 )) GiB"
+        ok=1
+    fi
+
+    pttype=$(probe "$disk" PTTYPE)
+    esp=$(find_esp "$disk")
+    if [ -n "$esp" ]; then
+        fstype=$(probe "$esp" TYPE)
+        case "$fstype" in
+            vfat)
+                mkdir -p "$ESPDIR"
+                if mount -t vfat -o ro "$esp" "$ESPDIR" 2>/dev/null; then
+                    free=$(df -Pk "$ESPDIR" | awk 'NR==2 {print $4}')
+                    old=$(du -sk "$ESPDIR/boot" 2>/dev/null | awk '{print $1}')
+                    umount "$ESPDIR"
+                    if [ $(( ${free:-0} + ${old:-0} )) -lt "$ESP_NEED_KIB" ]; then
+                        if uefi_boot; then
+                            echo "FAIL the EFI partition $esp has $(( ${free:-0} / 1024 )) MiB free; $SYSNAME needs 90 MiB there"
+                            ok=1
+                        else
+                            echo "WARN the EFI partition $esp is too full for UEFI start; the disk will start through BIOS only"
+                        fi
+                    else
+                        echo "WARN the EFI partition $esp is kept as it is; $SYSNAME is added to it"
+                    fi
+                else
+                    echo "FAIL the EFI partition $esp could not be read"
+                    ok=1
+                fi
+                ;;
+            "") echo "WARN the empty EFI partition $esp will be formatted (FAT32)" ;;
+            *)  echo "FAIL the EFI partition $esp holds $fstype, not FAT"; ok=1 ;;
+        esac
+    elif uefi_boot; then
+        echo "FAIL this computer starts in UEFI mode and $disk has no EFI system partition. Create one in GParted (FAT32, 300 MiB, flag esp) or choose Erase disk"
+        ok=1
+    else
+        echo "WARN $disk has no EFI system partition: the disk will start through BIOS only"
+    fi
+
+    if [ "$pttype" = gpt ] && ! has_biosboot "$disk"; then
+        if uefi_boot; then
+            echo "WARN $disk has no BIOS boot partition: the disk will start through UEFI only"
+        else
+            echo "FAIL this computer starts in BIOS mode and $disk (GPT) has no BIOS boot partition. Create one in GParted (1 MiB, unformatted, flag bios_grub) or choose Erase disk"
+            ok=1
+        fi
+    fi
+
+    fstype=$(probe "$root" TYPE)
+    [ -n "$fstype" ] && echo "WARN $root holds data ($fstype): everything on it will be erased"
+    [ $ok = 0 ] && echo "OK"
+    return $ok
+}
+
+# ------------------------------------------------------------- installing
+
+wait_for() {
+    i=0
+    while [ $i -lt 100 ]; do
+        ok=1
+        for d in "$@"; do [ -b "$d" ] || ok=0; done
+        [ $ok = 1 ] && return 0
+        sleep 0.1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+partition_erase() {
+    disk=$1
+    step partition 1
+    release_disk "$disk" || die "a partition of $disk is in use and could not be unmounted"
+    say "writing a new partition table on $disk"
+    # old signatures go first, the backup GPT at the end of the disk included,
+    # so nothing mistakes the disk for what it was
+    for p in $(disk_parts "$disk"); do wipefs -a -q "$p" 2>/dev/null; done
+    wipefs -a -q "$disk" 2>/dev/null
+    total=$(size_mib "$disk")
+    end=$((total - 1))
+    max=$((2 * 1024 * 1024 - 1))           # an MBR entry ends at 2 TiB
+    [ "$end" -gt "$max" ] && end=$max
+    parted -s -a optimal "$disk" -- \
+        mklabel msdos \
+        mkpart primary fat16 1MiB $((1 + ESP_MIB))MiB \
+        mkpart primary ext4 $((1 + ESP_MIB))MiB "${end}MiB" \
+        set 1 esp on \
+        set 1 boot on >/dev/null 2>&1 || die "could not write the partition table on $disk"
+    partprobe "$disk" 2>/dev/null || partx -u "$disk" 2>/dev/null
+    # udev looks at every new partition; formatting waits until it is done
+    udevadm settle --timeout=15 2>/dev/null
+    ESP=$(part_path "$disk" 1)
+    ROOT=$(part_path "$disk" 2)
+    wait_for "$ESP" "$ROOT" || die "the new partitions of $disk did not appear"
+    for p in "$ESP" "$ROOT"; do wipefs -a -q "$p" 2>/dev/null; done
+    ESP_NEW=1
+}
+
+partition_manual() {
+    disk=$1
+    step partition 1
+    release_disk "$disk" || die "a partition of $disk is in use and could not be unmounted"
+    ESP=$(find_esp "$disk")
+    ESP_NEW=0
+    if [ -n "$ESP" ] && [ -z "$(probe "$ESP" TYPE)" ]; then
+        ESP_NEW=2                            # empty: formatted, as FAT32
+    fi
+    wipefs -a -q "$ROOT" 2>/dev/null
+}
+
+format() {
+    step format 3
+    say "creating the filesystem on $ROOT"
+    # ext4 without the two newest features, so every boot loader in use reads it
+    mkfs.ext4 -F -q -L "$SYSNAME" -O ^orphan_file,^metadata_csum_seed "$ROOT" >/dev/null 2>&1 ||
+        mkfs.ext4 -F -q -L "$SYSNAME" "$ROOT" >/dev/null 2>&1 ||
+        die "could not create the filesystem on $ROOT"
+    case "$ESP_NEW" in
+        1) say "creating the EFI partition on $ESP"
+           mkfs.vfat -F 16 -n IFELXBOOT "$ESP" >/dev/null 2>&1 || die "could not format the EFI partition $ESP" ;;
+        2) say "formatting the empty EFI partition $ESP"
+           mkfs.vfat -F 32 -n EFI "$ESP" >/dev/null 2>&1 || die "could not format the EFI partition $ESP" ;;
+    esac
+    mkdir -p "$TARGET"
+    umount "$TARGET" 2>/dev/null
+    mount -t ext4 "$ROOT" "$TARGET" || die "could not mount $ROOT"
+}
+
+copy_system() {
+    step copy 5
+    say "copying $SYSNAME"
+    # 5% -> 85%: unsquashfs prints its own percentage on each line. The queues
+    # are kept small because this whole system runs from memory.
+    unsquashfs -f -percentage -da 64 -fr 64 -d "$TARGET" "$IMAGE" 2>&1 |
+    while IFS= read -r line; do
+        case "$line" in
+            *[!0-9\ ]*|"") [ -n "$line" ] && say "$line" ;;
+            *) echo "PROGRESS $((5 + ${line## } * 80 / 100))" ;;
+        esac
+    done
+    [ -d "$TARGET/usr" ] && [ -x "$TARGET/usr/local/sbin/ifelx-update-boot" ] ||
+        die "the copy of $SYSNAME did not complete"
+    mkdir -p "$TARGET/proc" "$TARGET/sys" "$TARGET/dev" "$TARGET/run" "$TARGET/tmp" \
+             "$TARGET/mnt" "$TARGET/media" "$TARGET/var/tmp" "$TARGET/var/lib/apt/lists/partial"
+    chmod 1777 "$TARGET/tmp" "$TARGET/var/tmp"
+}
+
+configure() {
+    step configure 86
+    # --- a system of its own: identity, logs, caches
+    : > "$TARGET/etc/machine-id"
+    rm -f "$TARGET/var/lib/dbus/machine-id"
+    [ -d "$TARGET/var/lib/dbus" ] && ln -s /etc/machine-id "$TARGET/var/lib/dbus/machine-id"
+    rm -f "$TARGET"/etc/ssh/ssh_host_*
+    find "$TARGET/var/log" -type f -delete 2>/dev/null
+    rm -rf "$TARGET/var/cache/ifelxui" 2>/dev/null
+    for f in .bash_history .lesshst .viminfo .wget-hsts .python_history .xsession-errors \
+             .ssh .gnupg .vnc .cache .local .config/pulse; do
+        rm -rf "$TARGET/root/$f"
+    done
+
+    # --- what the live medium does for convenience, undone
+    rm -f "$TARGET/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+    rmdir "$TARGET/etc/systemd/system/getty@tty1.service.d" 2>/dev/null
+    rm -f "$TARGET/etc/sudoers.d/99_nopasswd_live" "$TARGET/etc/sudoers.d/live"
+    for f in "$TARGET"/etc/sudoers.d/*; do
+        [ -f "$f" ] && grep -q NOPASSWD "$f" && { say "removing $(basename "$f") (sudo without a password)"; rm -f "$f"; }
+    done
+    rm -f "$TARGET/etc/live/config.conf" 2>/dev/null
+
+    # --- the account: every ordinary account in the image is the live one
+    for old in $(awk -F: '$3>=1000 && $3<60000 {print $1}' "$TARGET/etc/passwd"); do
+        say "removing the live account $old"
+        OLDHOME=$(awk -F: -v u="$old" '$1==u {print $6}' "$TARGET/etc/passwd")
+        chroot "$TARGET" userdel -f "$old" >/dev/null 2>&1
+        case "$OLDHOME" in /users/?*|/home/?*) rm -rf "${TARGET:?}$OLDHOME" ;; esac
+    done
+    for m in proc sys dev dev/pts; do
+        mkdir -p "$TARGET/$m"
+        mount --bind "/$m" "$TARGET/$m" 2>/dev/null
+    done
+    mkdir -p "$TARGET/users"
+    chroot "$TARGET" useradd -m -d "/users/$ACCOUNT" -s /bin/bash -U "$ACCOUNT" >/dev/null 2>&1 ||
+        die "could not create the account $ACCOUNT (the name may be taken by the system)"
+    GRPS=""
+    for g in sudo audio video netdev plugdev bluetooth input; do
+        grep -q "^$g:" "$TARGET/etc/group" && GRPS="${GRPS:+$GRPS,}$g"
+    done
+    [ -n "$GRPS" ] && chroot "$TARGET" usermod -aG "$GRPS" "$ACCOUNT"
+    printf '%s:%s\n' "$ACCOUNT" "$PASSWORD" | chroot "$TARGET" chpasswd || die "could not set the password"
+    PASSWORD=""
+    chroot "$TARGET" passwd -l root >/dev/null 2>&1
+    say "account $ACCOUNT created"
+
+    # the desktop settings that come with the image, for the new account
+    SETTINGS="$TARGET/var/lib/ifelxui/settings.ini"
+    mkdir -p "$TARGET/var/lib/ifelxui"
+    if [ -f "$SETTINGS" ]; then
+        awk -v u="$ACCOUNT" '
+            /^\[/ { if (insess && !done) { print "user = " u; done = 1 } insess = ($0 == "[session]") }
+            insess && /^user[ \t]*=/ { print "user = " u; done = 1; next }
+            /^\[autostart\]/ { print; skip = 1; next }
+            skip && /^\[/ { skip = 0 }
+            skip { next }
+            { print }
+            END { if (!done) { if (!insess) print "[session]"; print "user = " u } }
+        ' "$SETTINGS" > "$SETTINGS.new" && mv "$SETTINGS.new" "$SETTINGS"
+        chmod 644 "$SETTINGS"
+    fi
+
+    echo "$HOSTNAME_NEW" > "$TARGET/etc/hostname"
+    grep -q '^127\.0\.0\.1' "$TARGET/etc/hosts" 2>/dev/null ||
+        printf '127.0.0.1\tlocalhost\n' >> "$TARGET/etc/hosts"
+    if ! grep -qw "$HOSTNAME_NEW" "$TARGET/etc/hosts" 2>/dev/null; then
+        printf '127.0.1.1\t%s\n' "$HOSTNAME_NEW" >> "$TARGET/etc/hosts"
+    fi
+
+    UUID=$(probe "$ROOT" UUID)
+    say "filesystem UUID: ${UUID:-none}"
+    if [ -n "$UUID" ]; then ROOTSPEC="UUID=$UUID"; else ROOTSPEC="$ROOT"; fi
+    cat > "$TARGET/etc/fstab" <<EOF
+# $SYSNAME - written by the ODE installer
+$ROOTSPEC  /  ext4  errors=remount-ro  0  1
+proc  /proc  proc  defaults  0  0
+EOF
+    ESPSPEC=""
+    if [ -n "$ESP" ]; then
+        ESPUUID=$(probe "$ESP" UUID)
+        if [ -n "$ESPUUID" ]; then ESPSPEC="UUID=$ESPUUID"; else ESPSPEC="$ESP"; fi
+        printf '%s  /boot/efi  vfat  umask=0077,noauto  0  2\n' "$ESPSPEC" >> "$TARGET/etc/fstab"
+        mkdir -p "$TARGET/boot/efi"
+    fi
+}
+
+install_efi() {
+    step efi 90
+    [ -n "$ESP" ] || { say "no EFI partition: UEFI start is not set up"; return 0; }
+    mkdir -p "$ESPDIR"
+    umount "$ESPDIR" 2>/dev/null
+    mount -t vfat "$ESP" "$ESPDIR" 2>/dev/null || die "could not mount the EFI partition $ESP"
+    # IFelxBoot: the medium's own (the current build), else the image's copy,
+    # the same order as IFelxOS2's install.sh
+    LOADER=""
+    for f in "$MEDIUM/EFI/BOOT/BOOTX64.EFI" "$TARGET/dex/IFelxUi/installer/BOOTX64.EFI"; do
+        [ -f "$f" ] && { LOADER=$f; break; }
+    done
+    [ -n "$LOADER" ] || { umount "$ESPDIR"; die "IFelxBoot was found neither on the medium nor in the $SYSNAME image"; }
+    mkdir -p "$ESPDIR/EFI/$SYSNAME" "$ESPDIR/EFI/BOOT"
+    cp "$LOADER" "$ESPDIR/EFI/$SYSNAME/BOOTX64.EFI" || { umount "$ESPDIR"; die "could not write IFelxBoot to $ESP"; }
+    # The firmware's fallback path. On a disk of its own it is IFelxBoot; on a
+    # shared EFI partition another system's loader there is left alone.
+    if [ "$ESP_NEW" != 0 ] || [ ! -f "$ESPDIR/EFI/BOOT/BOOTX64.EFI" ]; then
+        cp "$LOADER" "$ESPDIR/EFI/BOOT/BOOTX64.EFI"
+    fi
+    sync
+    umount "$ESPDIR"
+}
+
+install_boot() {
+    step bootloader 93
+    # --- BIOS: GRUB
+    BIOS_OK=0
+    mkdir -p "$TARGET/boot/grub"
+    if [ "$MODE" = erase ]; then
+        # the same loader IFelxOS2's own installer embeds, for the same layout
+        BI="$TARGET/dex/IFelxUi/installer"
+        if [ -f "$BI/boot.img" ] && [ -f "$BI/core.img" ] && [ -d "$BI/i386-pc" ]; then
+            cp -a "$BI/i386-pc" "$TARGET/boot/grub/"
+            dd if="$BI/boot.img" of="$DISK" bs=440 count=1 conv=notrunc 2>/dev/null &&
+            dd if="$BI/core.img" of="$DISK" bs=512 seek=1 conv=notrunc 2>/dev/null &&
+            BIOS_OK=1
+        fi
+    fi
+    if [ "$BIOS_OK" = 0 ]; then
+        if [ "$(probe "$DISK" PTTYPE)" = gpt ] && ! has_biosboot "$DISK"; then
+            say "no BIOS boot partition on $DISK: BIOS start is not set up"
+        elif grub-install --target=i386-pc --boot-directory="$TARGET/boot" "$DISK" 2>&1 |
+                 sed 's/^/grub-install: /'; then
+            [ -f "$TARGET/boot/grub/i386-pc/core.img" ] && BIOS_OK=1
+        fi
+    fi
+    if [ "$BIOS_OK" = 1 ]; then
+        say "BIOS start set up"
+    elif uefi_boot; then
+        warn "the disk will start through UEFI only"
+    else
+        die "the boot loader could not be written to $DISK"
+    fi
+
+    # --- the boot configuration, written by the program that keeps it right
+    # after kernel updates (grub.cfg, and the kernel on the EFI partition)
+    cat > "$TARGET/etc/ifelx-installed" <<EOF
+# $SYSNAME - written by the ODE installer; read by ifelx-update-boot
+ROOTSPEC=$ROOTSPEC
+FSTYPE=ext4
+ESPSPEC=$ESPSPEC
+EOF
+    IFELX_ESP_DEV="$ESP" chroot "$TARGET" /usr/local/sbin/ifelx-update-boot 2>&1 ||
+        die "the boot configuration could not be written"
+    grep -qs " $TARGET/boot/efi " /proc/mounts && umount "$TARGET/boot/efi"
+
+    # --- UEFI: a boot entry of its own, first in the firmware's order
+    if [ -n "$ESP" ] && uefi_boot && command -v efibootmgr >/dev/null 2>&1; then
+        mkdir -p /sys/firmware/efi/efivars
+        grep -qs efivarfs /proc/mounts || mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
+        for b in $(efibootmgr 2>/dev/null | sed -n "s/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\} $SYSNAME\b.*/\1/p"); do
+            efibootmgr -q -b "$b" -B >/dev/null 2>&1
+        done
+        if efibootmgr -q -c -d "$DISK" -p "$(part_number "$ESP")" -L "$SYSNAME" \
+               -l "\\EFI\\$SYSNAME\\BOOTX64.EFI" >/dev/null 2>&1; then
+            say "UEFI boot entry $SYSNAME added"
+        elif [ "$ESP_NEW" != 0 ]; then
+            say "the firmware refused a boot entry; it starts the disk through its fallback path"
+        else
+            warn "the firmware refused a boot entry: choose $SYSNAME in the firmware's boot menu"
+        fi
+    fi
+}
+
+# ------------------------------------------------------------------- main
+
+case "${1:-}" in
+    check)
+        case "${2:-}" in
+            erase)  [ $# -eq 3 ] || { echo "FAIL usage"; exit 1; }; check_erase "$3"; exit $? ;;
+            manual) [ $# -eq 4 ] || { echo "FAIL usage"; exit 1; }; check_manual "$3" "$4"; exit $? ;;
+        esac
+        echo "FAIL usage"; exit 1 ;;
+    erase)
+        [ $# -eq 4 ] || die "usage: ode-install erase <disk> <hostname> <account>"
+        MODE=erase; DISK=$2; ROOT=""; HOSTNAME_NEW=$3; ACCOUNT=$4 ;;
+    manual)
+        [ $# -eq 5 ] || die "usage: ode-install manual <disk> <root-partition> <hostname> <account>"
+        MODE=manual; DISK=$2; ROOT=$3; HOSTNAME_NEW=$4; ACCOUNT=$5 ;;
+    *)
+        echo "usage: ode-install check erase|manual ... | erase ... | manual ..." >&2; exit 2 ;;
+esac
+
+# the password arrives on standard input, never as an argument
+PASSWORD=""
+IFS= read -r PASSWORD || true
+
+case "$HOSTNAME_NEW" in
+    ''|-*|*-|*[!A-Za-z0-9-]*) die "the computer name may only hold letters, digits and '-'" ;;
+esac
+[ ${#HOSTNAME_NEW} -le 63 ] || die "the computer name is longer than 63 characters"
+case "$ACCOUNT" in
+    ''|-*|[0-9]*|*[!a-z0-9_-]*) die "the account name may only hold a-z, 0-9, '_' and '-', and start with a letter" ;;
+esac
+[ ${#ACCOUNT} -le 32 ] || die "the account name is longer than 32 characters"
+[ ${#PASSWORD} -ge 4 ] || die "the account needs a password of at least 4 characters"
+
+if [ "$MODE" = erase ]; then
+    check_erase "$DISK" > /tmp/ode-check.$$ || { m=$(grep '^FAIL' /tmp/ode-check.$$ | head -n 1); rm -f /tmp/ode-check.$$; die "${m#FAIL }"; }
+else
+    check_manual "$DISK" "$ROOT" > /tmp/ode-check.$$ || { m=$(grep '^FAIL' /tmp/ode-check.$$ | head -n 1); rm -f /tmp/ode-check.$$; die "${m#FAIL }"; }
+fi
+rm -f /tmp/ode-check.$$
+
+say "installing $SYSNAME on $DISK ($MODE)"
+if [ "$MODE" = erase ]; then partition_erase "$DISK"; else partition_manual "$DISK"; fi
+format
+copy_system
+configure
+install_efi
+install_boot
+step finish 99
+cleanup
+sync
+say "installation complete"
+echo "DONE"

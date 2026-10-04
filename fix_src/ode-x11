@@ -1,0 +1,89 @@
+#!/bin/sh
+# Starts Xorg + openbox + the ODE installer app. Returns the app exit code.
+
+export DISPLAY=:0
+export HOME=/root
+export XDG_RUNTIME_DIR=/tmp/runtime-root
+export XDG_SESSION_TYPE=x11
+export SDL_VIDEODRIVER=x11
+export SDL_AUDIODRIVER=dummy
+export LIBGL_ALWAYS_SOFTWARE=1
+# A full-screen SDL window minimizes itself when another window takes the
+# focus, and openbox here has no panel to bring it back: the screen stays
+# black. This is what froze the installer when GParted opened.
+export SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS=0
+export LANG=C.UTF-8
+export GDK_BACKEND=x11
+export NO_AT_BRIDGE=1
+export ODE_SESSION=1
+
+SLOG=/var/log/ode-session.log
+APP=/app/app.bin
+
+mkdir -p "$XDG_RUNTIME_DIR" /tmp/.X11-unix /var/lib/xkb /var/log
+chmod 700 "$XDG_RUNTIME_DIR"
+chmod 1777 /tmp/.X11-unix
+rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
+
+echo "---- session start $(date '+%F %T') ----" >> "$SLOG"
+
+/usr/sbin/ode-xorg-conf > /run/ode-xorg.conf 2>>"$SLOG"
+
+Xorg :0 vt1 \
+    -config /run/ode-xorg.conf \
+    -nolisten tcp \
+    -noreset \
+    -logfile /var/log/Xorg.0.log \
+    >>"$SLOG" 2>&1 &
+XPID=$!
+
+# A dead child stays a zombie until waited for, so kill -0 is not enough.
+xorg_alive() {
+    [ -r "/proc/$XPID/stat" ] || return 1
+    state=$(sed 's/^[0-9]* (.*) \(.\).*/\1/' "/proc/$XPID/stat" 2>/dev/null)
+    [ "$state" != Z ]
+}
+
+# Xorg creates its socket before probing screens, so wait until it answers requests.
+ready=0
+i=0
+while [ "$i" -lt 200 ]; do
+    if ! xorg_alive; then
+        break
+    fi
+    if [ -S /tmp/.X11-unix/X0 ] && xset q >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    i=$((i + 1))
+    sleep 0.1
+done
+
+if [ "$ready" != 1 ]; then
+    echo "Xorg failed to start" >> "$SLOG"
+    grep -E '\(EE\)' /var/log/Xorg.0.log >> "$SLOG" 2>/dev/null
+    kill "$XPID" 2>/dev/null
+    wait "$XPID" 2>/dev/null
+    exit 1
+fi
+
+xsetroot -solid black >/dev/null 2>&1
+xset s off -dpms s noblank >/dev/null 2>&1
+
+openbox >>"$SLOG" 2>&1 &
+WMPID=$!
+sleep 1
+
+if [ -x "$APP" ]; then
+    cd /app
+    "$APP" >>"$SLOG" 2>&1
+    rc=$?
+else
+    echo "installer binary $APP not found" >> "$SLOG"
+    rc=127
+fi
+
+kill "$WMPID" 2>/dev/null
+kill "$XPID" 2>/dev/null
+wait "$XPID" 2>/dev/null
+exit "$rc"

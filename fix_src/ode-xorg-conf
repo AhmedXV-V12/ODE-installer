@@ -1,0 +1,69 @@
+#!/bin/sh
+# Generates an Xorg config for the current hardware.
+#
+# Input devices are not listed here: udev runs in the installer, so Xorg adds
+# every keyboard, mouse and touchpad as it appears - also a touchpad that comes
+# up after Xorg, or a mouse plugged in later - and drives them with libinput.
+# Only the graphics device is chosen here, by what the kernel offers.
+
+if [ -e /dev/dri/card0 ]; then
+    DRIVER=modesetting
+elif [ -e /dev/fb0 ]; then
+    DRIVER=fbdev
+else
+    DRIVER=vesa
+fi
+
+cat <<EOF
+Section "ServerFlags"
+    Option "AutoAddGPU" "false"
+    Option "BlankTime" "0"
+    Option "StandbyTime" "0"
+    Option "SuspendTime" "0"
+    Option "OffTime" "0"
+EndSection
+
+Section "InputClass"
+    Identifier "ODE-touchpad"
+    MatchIsTouchpad "on"
+    Driver "libinput"
+    Option "Tapping" "on"
+    Option "TappingDrag" "on"
+    Option "DisableWhileTyping" "on"
+EndSection
+
+Section "InputClass"
+    Identifier "ODE-keyboard"
+    MatchIsKeyboard "on"
+    Option "XkbLayout" "us"
+EndSection
+
+Section "Device"
+    Identifier "ODE-GPU"
+    Driver "$DRIVER"
+EOF
+
+if [ "$DRIVER" = modesetting ]; then
+    echo '    Option "AccelMethod" "none"'
+    echo '    Option "kmsdev" "/dev/dri/card0"'
+elif [ "$DRIVER" = fbdev ]; then
+    echo '    Option "fbdev" "/dev/fb0"'
+fi
+
+cat <<EOF
+EndSection
+
+Section "Screen"
+    Identifier "ODE-Screen"
+    Device "ODE-GPU"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+    EndSubSection
+EndSection
+
+Section "ServerLayout"
+    Identifier "ODE-Layout"
+    Screen "ODE-Screen"
+EndSection
+EOF
